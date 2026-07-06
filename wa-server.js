@@ -1,178 +1,144 @@
-const express = require('express');
-const cors    = require('cors');
-const qrcode  = require('qrcode');
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const path = require('path');
-const fs   = require('fs');
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const express = require('express')
+const cors = require('cors')
+const QRCode = require('qrcode')
+const pino = require('pino')
+const fs = require('fs')
+const path = require('path')
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-app.use(cors());
-app.use(express.json());
+// Multi-session: each business gets its own WhatsApp session
+// Key = negocioId (UUID from Supabase)
+const sessions = new Map()
 
-// ─── Estado global ───────────────────────────────────────────
-let sock         = null;
-let qrBase64     = null;
-let waStatus     = 'disconnected'; // 'disconnected' | 'qr' | 'connected'
-let waPhone      = '';
-let reconnecting = false;
-
-// ─── Iniciar WhatsApp ─────────────────────────────────────────
-async function conectarWA() {
-  const authDir = path.join(__dirname, 'wa_auth');
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version }          = await fetchLatestBaileysVersion();
-
-  sock = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
-    },
-    printQRInTerminal: false,
-    browser: ['FidelizApp', 'Chrome', '120.0.0']
-  });
-
-  // QR generado
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      waStatus = 'qr';
-      qrBase64 = await qrcode.toDataURL(qr);
-      console.log('[WA] QR generado — esperando escaneo...');
-    }
-
-    if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      console.log('[WA] Desconectado. Reconectar:', shouldReconnect, '| código:', code);
-      waStatus = 'disconnected';
-      qrBase64 = null;
-      waPhone  = '';
-      if (shouldReconnect && !reconnecting) {
-        reconnecting = true;
-        setTimeout(() => { reconnecting = false; conectarWA(); }, 5000);
-      }
-    }
-
-    if (connection === 'open') {
-      waStatus = 'connected';
-      qrBase64 = null;
-      waPhone  = sock.user?.id?.split(':')[0] || '';
-      console.log('[WA] ✅ Conectado como', waPhone);
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
+async function getOrCreateSession(sessionId) {
+  if (sessions.has(sessionId)) return sessions.get(sessionId)
+  const session = { socket: null, status: 'connecting', qrBase64: null, retries: 0 }
+  sessions.set(sessionId, session)
+  await startSession(sessionId, session)
+  return session
 }
 
-// ─── Endpoints ────────────────────────────────────────────────
+async function startSession(sessionId, session) {
+  const authDir = path.join('wa_auth', sessionId)
+  fs.mkdirSync(authDir, { recursive: true })
+  const { state, saveCreds } = await useMultiFileAuthState(authDir)
 
-// Estado y QR
-app.get('/status', (req, res) => {
-  res.json({ status: waStatus, phone: waPhone, hasQR: !!qrBase64 });
-});
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: 'silent' })
+  })
+  session.socket = sock
 
-app.get('/qr', (req, res) => {
-  if (!qrBase64) {
-    return res.json({ qr: null, status: waStatus });
-  }
-  res.json({ qr: qrBase64, status: waStatus });
-});
-
-// Cerrar sesión (para forzar nuevo QR)
-app.post('/logout', async (req, res) => {
-  try {
-    if (sock) await sock.logout();
-    const authDir = path.join(__dirname, 'wa_auth');
-    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true });
-    waStatus = 'disconnected'; qrBase64 = null; waPhone = '';
-    setTimeout(() => conectarWA(), 2000);
-    res.json({ ok: true, message: 'Sesión cerrada. Nuevo QR en camino...' });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-// Enviar mensaje individual
-app.post('/send-message', async (req, res) => {
-  const { to, message, nombre } = req.body;
-  if (!to || !message) return res.status(400).json({ success: false, error: 'Faltan: to y message' });
-  if (waStatus !== 'connected') return res.status(503).json({ success: false, error: 'WhatsApp no conectado' });
-
-  // Formatear número: +549XXXXXXXXXX → 549XXXXXXXXXX@s.whatsapp.net
-  let numero = to.replace(/\D/g, '');
-  if (numero.startsWith('0')) numero = numero.slice(1);
-  const jid = numero + '@s.whatsapp.net';
-
-  const texto = (message || '')
-    .replace(/{nombre}/gi, nombre || '')
-    .replace(/{name}/gi, nombre || '');
-
-  try {
-    await sock.sendMessage(jid, { text: texto });
-    console.log('[WA] Mensaje enviado a', to);
-    res.json({ success: true, to, jid });
-  } catch (e) {
-    console.error('[WA] Error enviando a', to, e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Campaña masiva
-app.post('/send-campaign', async (req, res) => {
-  const { recipients, message } = req.body;
-  if (!recipients || !Array.isArray(recipients) || !message)
-    return res.status(400).json({ success: false, error: 'Faltan: recipients (array) y message' });
-  if (waStatus !== 'connected')
-    return res.status(503).json({ success: false, error: 'WhatsApp no conectado' });
-
-  const batch   = recipients.slice(0, 100);
-  const results = [];
-
-  for (const r of batch) {
-    const texto = (message || '')
-      .replace(/{nombre}/gi, r.nombre || r.name || '')
-      .replace(/{name}/gi, r.nombre || r.name || '');
-
-    let numero = (r.to || '').replace(/\D/g, '');
-    if (numero.startsWith('0')) numero = numero.slice(1);
-    const jid = numero + '@s.whatsapp.net';
-
-    try {
-      await sock.sendMessage(jid, { text: texto });
-      results.push({ to: r.to, success: true });
-    } catch (e) {
-      results.push({ to: r.to, success: false, error: e.message });
+  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      session.qrBase64 = await QRCode.toDataURL(qr)
+      session.status = 'qr'
     }
+    if (connection === 'open') {
+      session.status = 'connected'
+      session.qrBase64 = null
+      session.retries = 0
+      console.log('Session connected:', sessionId)
+    }
+    if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode
+      const loggedOut = code === DisconnectReason.loggedOut
+      session.status = loggedOut ? 'disconnected' : 'connecting'
+      session.socket = null
+      if (!loggedOut && session.retries < 5) {
+        session.retries++
+        setTimeout(() => startSession(sessionId, session), 3000)
+      }
+      console.log('Session closed:', sessionId, '| loggedOut:', loggedOut)
+    }
+  })
+}
 
-    // Rate limiting: 1 mensaje cada 1.5s para evitar bans
-    await new Promise(res => setTimeout(res, 1500));
-  }
+function getSession(req, res) {
+  const sessionId = req.query.session || req.body?.session
+  if (!sessionId) { res.status(400).json({ error: 'session requerida' }); return null }
+  return sessionId
+}
 
-  const enviados = results.filter(r => r.success).length;
-  res.json({ success: true, total: batch.length, enviados, fallidos: batch.length - enviados, results });
-});
+function formatPhone(phone) {
+  let p = (phone || '').replace(/\D/g, '')
+  if (p.startsWith('0')) p = p.slice(1)
+  if (!p.startsWith('54')) p = '54' + p
+  return p + '@s.whatsapp.net'
+}
 
-// Health check
+// ─── Endpoints ───────────────────────────────────────────────────
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'FidelizApp WA Server', waStatus, ts: new Date().toISOString() });
-});
+  res.json({ ok: true, sessions: sessions.size })
+})
 
-// ─── Iniciar ──────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`[Server] FidelizApp WA Server corriendo en puerto ${PORT}`);
-  conectarWA();
-});
+app.get('/qr', async (req, res) => {
+  const sessionId = getSession(req, res)
+  if (!sessionId) return
+  const session = await getOrCreateSession(sessionId)
+  if (session.status === 'connected') return res.json({ status: 'connected' })
+  if (session.qrBase64) return res.json({ status: 'qr', qr: session.qrBase64 })
+  res.json({ status: session.status })
+})
+
+app.get('/status', async (req, res) => {
+  const sessionId = getSession(req, res)
+  if (!sessionId) return
+  const session = sessions.get(sessionId)
+  res.json({ status: session ? session.status : 'disconnected' })
+})
+
+app.post('/send-message', async (req, res) => {
+  const { session: sessionId, phone, message } = req.body
+  if (!sessionId) return res.status(400).json({ error: 'session requerida' })
+  const session = sessions.get(sessionId)
+  if (!session || session.status !== 'connected') return res.status(503).json({ error: 'WhatsApp no conectado' })
+  try {
+    await session.socket.sendMessage(formatPhone(phone), { text: message })
+    res.json({ ok: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.post('/send-campaign', async (req, res) => {
+  const { session: sessionId, recipients, message } = req.body
+  if (!sessionId) return res.status(400).json({ error: 'session requerida' })
+  const session = sessions.get(sessionId)
+  if (!session || session.status !== 'connected') return res.status(503).json({ error: 'WhatsApp no conectado' })
+  const results = []
+  for (const r of recipients) {
+    try {
+      const msg = message.replace('{nombre}', r.nombre || '')
+      await session.socket.sendMessage(formatPhone(r.phone), { text: msg })
+      results.push({ phone: r.phone, ok: true })
+    } catch (e) {
+      results.push({ phone: r.phone, ok: false, error: e.message })
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500))
+  }
+  res.json({ results })
+})
+
+app.post('/logout', async (req, res) => {
+  const sessionId = req.query.session || req.body?.session
+  if (!sessionId) return res.status(400).json({ error: 'session requerida' })
+  const session = sessions.get(sessionId)
+  if (session?.socket) {
+    try { await session.socket.logout() } catch(e) {}
+  }
+  sessions.delete(sessionId)
+  const authDir = path.join('wa_auth', sessionId)
+  fs.rmSync(authDir, { recursive: true, force: true })
+  res.json({ ok: true })
+})
+
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log('FidelizApp WA Server running on port', PORT))
